@@ -82,7 +82,7 @@ def stereochemistry(m):
 def viewer_html(block, style, labels):
     block=block.replace("\\","\\\\").replace("`","\\`").replace("</script>","<\\/script>")
     styles={"Ball and stick":"{stick:{radius:0.18},sphere:{scale:0.24}}","Stick":"{stick:{radius:0.18}}","Sphere":"{sphere:{scale:0.32}}","Line":"{line:{linewidth:2}}"}
-    label_code="viewer.addPropertyLabels('index', {}, {font:'Arial',fontSize:12,fontColor:'black',showBackground:true,backgroundColor:'white',backgroundOpacity:0.75});".format("true") if labels else ""
+    label_code="viewer.addPropertyLabels('index', {}, {font:'Arial',fontSize:12,fontColor:'black',showBackground:true,backgroundColor:'white',backgroundOpacity:0.75});" if labels else ""
     sty=styles[style]
     return f"""<div id="v" style="height:500px;width:100%;border:1px solid #ccc;border-radius:10px"></div><div id="atominfo" style="padding:8px;font-family:Arial">Click an atom to inspect its index, element and coordinates.</div>
 <script src="https://3Dmol.org/build/3Dmol-min.js"></script><script>
