@@ -1,281 +1,173 @@
-import io
-import requests
+import io, math, requests
 import streamlit as st
 import streamlit.components.v1 as components
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw, Descriptors, rdMolDescriptors, Lipinski
 from rdkit.Chem.rdchem import BondType
 
-def _png_bytes(mol):
-    from rdkit.Chem import Draw
-    image = Draw.MolToImage(mol, size=(1000, 700))
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
 st.set_page_config(page_title="Cheminformatics Explorer", page_icon="🧪", layout="wide")
 
-st.title("🧪 Cheminformatics Explorer")
-st.caption("Explore 2D and 3D molecular structures, formulae, bonds, SMILES, and stereochemistry.")
-st.info("Educational tool: generated 3D conformations are estimates, not experimental structures or a full conformational analysis.")
+def png_bytes(m):
+    b=io.BytesIO(); Draw.MolToImage(m,size=(1000,700)).save(b,format="PNG"); return b.getvalue()
 
+def lookup_name(name):
+    url="https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"+requests.utils.quote(name.strip(),safe="")+"/property/IsomericSMILES,ConnectivitySMILES/JSON"
+    r=requests.get(url,timeout=20)
+    if r.status_code!=200: raise ValueError("PubChem could not find that name. Try another name or enter SMILES.")
+    props=r.json().get("PropertyTable",{}).get("Properties",[])
+    if not props: raise ValueError("PubChem returned no structure.")
+    return props[0].get("SMILES") or props[0].get("ConnectivitySMILES")
+
+def parse(text, mode):
+    if not text.strip(): raise ValueError("Enter a molecule name or SMILES.")
+    smi=lookup_name(text) if mode=="Molecule name" else text.strip()
+    m=Chem.MolFromSmiles(smi)
+    if m is None: raise ValueError("Invalid molecule input. Check the name or SMILES.")
+    Chem.AssignStereochemistry(m,cleanIt=True,force=True)
+    return m,smi
+
+def build3d(m, add_h=True):
+    x=Chem.AddHs(Chem.Mol(m)) if add_h else Chem.Mol(m)
+    p=AllChem.ETKDGv3(); p.randomSeed=2026
+    if AllChem.EmbedMolecule(x,p)!=0: raise ValueError("Could not generate a 3D conformer.")
+    if AllChem.MMFFHasAllMoleculeParams(x): AllChem.MMFFOptimizeMolecule(x,maxIters=300)
+    elif AllChem.UFFHasAllMoleculeParams(x): AllChem.UFFOptimizeMolecule(x,maxIters=300)
+    return x
+
+def bond_analysis(m):
+    x=Chem.AddHs(Chem.Mol(m))
+    try: Chem.Kekulize(x,clearAromaticFlags=True)
+    except Exception: pass
+    counts={"Single":0,"Double":0,"Triple":0,"Aromatic/unlocalized":0}
+    sigma=pi=0; rows=[]
+    for b in x.GetBonds():
+        t=b.GetBondType()
+        if t==BondType.SINGLE: counts["Single"]+=1; sigma+=1; pc=0
+        elif t==BondType.DOUBLE: counts["Double"]+=1; sigma+=1; pi+=1; pc=1
+        elif t==BondType.TRIPLE: counts["Triple"]+=1; sigma+=1; pi+=2; pc=2
+        elif t==BondType.AROMATIC: counts["Aromatic/unlocalized"]+=1; sigma+=1; pc="unlocalized"
+        else: pc=0
+        rows.append({"Atom 1":f'{b.GetBeginAtomIdx()} ({b.GetBeginAtom().GetSymbol()})',"Atom 2":f'{b.GetEndAtomIdx()} ({b.GetEndAtom().GetSymbol()})',"Bond type":str(t),"Aromatic":b.GetIsAromatic(),"Pi contribution":pc})
+    return counts,sigma,pi,rows
+
+def geometry(m):
+    conf=m.GetConformer(); bonds=[]; angles=[]
+    for b in m.GetBonds():
+        i,j=b.GetBeginAtomIdx(),b.GetEndAtomIdx(); p=conf.GetAtomPosition(i); q=conf.GetAtomPosition(j)
+        d=math.sqrt((p.x-q.x)**2+(p.y-q.y)**2+(p.z-q.z)**2)
+        bonds.append({"Atom 1":f"{i} ({m.GetAtomWithIdx(i).GetSymbol()})","Atom 2":f"{j} ({m.GetAtomWithIdx(j).GetSymbol()})","Bond type":str(b.GetBondType()),"Length (Å)":round(d,3)})
+    for c in m.GetAtoms():
+        k=c.GetIdx(); ns=[a.GetIdx() for a in c.GetNeighbors()]; pc=conf.GetAtomPosition(k)
+        for ii in range(len(ns)):
+            for jj in range(ii+1,len(ns)):
+                i,j=ns[ii],ns[jj]; p=conf.GetAtomPosition(i); q=conf.GetAtomPosition(j)
+                v=(p.x-pc.x,p.y-pc.y,p.z-pc.z); w=(q.x-pc.x,q.y-pc.y,q.z-pc.z)
+                dot=sum(a*b for a,b in zip(v,w)); nv=math.sqrt(sum(a*a for a in v)); nw=math.sqrt(sum(a*a for a in w))
+                if nv and nw:
+                    ang=math.degrees(math.acos(max(-1,min(1,dot/(nv*nw)))))
+                    angles.append({"Atom 1":f"{i} ({m.GetAtomWithIdx(i).GetSymbol()})","Central atom":f"{k} ({c.GetSymbol()})","Atom 3":f"{j} ({m.GetAtomWithIdx(j).GetSymbol()})","Angle (°)":round(ang,2)})
+    return bonds,angles
+
+def stereochemistry(m):
+    Chem.AssignStereochemistry(m,cleanIt=True,force=True)
+    centers=[]
+    for i,label in Chem.FindMolChiralCenters(m,includeUnassigned=True,includeCIP=True,useLegacyImplementation=False):
+        a=m.GetAtomWithIdx(i); centers.append({"Atom index":i,"Element":a.GetSymbol(),"Configuration":label,"Chiral tag":str(a.GetChiralTag())})
+    bonds=[]
+    for b in m.GetBonds():
+        if b.GetStereo()!=Chem.BondStereo.STEREONONE:
+            bonds.append({"Bond index":b.GetIdx(),"Atoms":f"{b.GetBeginAtomIdx()}–{b.GetEndAtomIdx()}","Stereo":str(b.GetStereo())})
+    return centers,bonds
+
+def viewer_html(block, style, labels):
+    block=block.replace("\\","\\\\").replace("`","\\`").replace("</script>","<\\/script>")
+    styles={"Ball and stick":"{stick:{radius:0.18},sphere:{scale:0.24}}","Stick":"{stick:{radius:0.18}}","Sphere":"{sphere:{scale:0.32}}","Line":"{line:{linewidth:2}}"}
+    label_code="viewer.addPropertyLabels('index', {}, {font:'Arial',fontSize:12,fontColor:'black',showBackground:true,backgroundColor:'white',backgroundOpacity:0.75});".format("true") if labels else ""
+    sty=styles[style]
+    return f"""<div id="v" style="height:500px;width:100%;border:1px solid #ccc;border-radius:10px"></div><div id="atominfo" style="padding:8px;font-family:Arial">Click an atom to inspect its index, element and coordinates.</div>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script><script>
+const el=document.getElementById('v'); const viewer=$3Dmol.createViewer(el,{{backgroundColor:'white'}});
+viewer.addModel(`{block}`,'mol'); viewer.setStyle({{}},{sty}); {label_code}
+viewer.setClickable({{}},true,function(atom,viewer){{
+document.getElementById('atominfo').innerHTML='<b>Selected atom</b>: index '+atom.index+' · element '+atom.elem+' · coordinates (Å): '+Number(atom.x).toFixed(3)+', '+Number(atom.y).toFixed(3)+', '+Number(atom.z).toFixed(3);
+viewer.setStyle({{}},{sty}); viewer.setStyle({{index:atom.index}},{{stick:{{radius:0.24,color:'magenta'}},sphere:{{scale:0.45,color:'magenta'}}}}); viewer.render();
+}});
+viewer.zoomTo(); viewer.render(); window.addEventListener('resize',()=>viewer.resize());
+</script>"""
+
+st.title("🧪 Cheminformatics Explorer")
+st.caption("2D/3D structures • bonding • geometry • stereochemistry")
+st.info("3D coordinates are computational estimates, not experimental measurements. Aromatic sigma/pi counts are a simplified educational representation.")
 with st.sidebar:
     st.header("Molecule input")
-    input_mode = st.radio("Input type", ["Molecule name", "SMILES"])
-    default_value = "aspirin" if input_mode == "Molecule name" else "CC(=O)OC1=CC=CC=C1C(=O)O"
-    query = st.text_input(
-        "Enter molecule name" if input_mode == "Molecule name" else "Enter SMILES",
-        value=default_value,
-        help="Examples: aspirin, caffeine, ethanol, benzene" if input_mode == "Molecule name" else "Examples: CCO (ethanol), c1ccccc1 (benzene)"
-    )
-    include_h = st.checkbox("Show explicit hydrogens in 3D", value=True)
-    make_3d = st.button("Analyze molecule", type="primary", use_container_width=True)
-    st.markdown("---")
-    st.caption("Molecule-name lookup uses the PubChem public service and requires internet access.")
-
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-
-def fetch_smiles_from_pubchem(name: str) -> str:
-    url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{}/property/IsomericSMILES,CanonicalSMILES/JSON".format(requests.utils.quote(name.strip(), safe=""))
-    response = requests.get(url, timeout=15)
-    if response.status_code != 200:
-        raise ValueError("PubChem could not find that name. Try a more specific name or enter SMILES directly.")
-    data = response.json()
-    props = data.get("PropertyTable", {}).get("Properties", [])
-    if not props:
-        raise ValueError("No matching compound was returned by PubChem.")
-    return props[0].get("SMILES") or props[0].get("ConnectivitySMILES") or props[0].get("CanonicalSMILES")
-
-def build_molecule(text: str, mode: str):
-    if not text.strip():
-        raise ValueError("Enter a molecule name or SMILES string.")
-    resolved_smiles = fetch_smiles_from_pubchem(text) if mode == "Molecule name" else text.strip()
-    mol = Chem.MolFromSmiles(resolved_smiles)
-    if mol is None:
-        raise ValueError("This input could not be parsed as a valid molecule. Check the name or SMILES.")
-    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-    return mol, resolved_smiles
-
-def count_bonds(mol):
-    single = double = triple = aromatic = other = 0
-    sigma = pi = 0
-    # Aromatic systems are kekulized on a copy to estimate sigma/pi contributions.
-    kekule = Chem.Mol(mol)
+    mode=st.radio("Input type",["Molecule name","SMILES"])
+    query=st.text_input("Molecule name" if mode=="Molecule name" else "SMILES",value="ethanol" if mode=="Molecule name" else "CCO")
+    add_h=st.checkbox("Include hydrogens in 3D model",True)
+    st.subheader("3D viewer settings")
+    style=st.selectbox("Display style",["Ball and stick","Stick","Sphere","Line"])
+    labels=st.checkbox("Show atom indices",False)
+    go=st.button("Analyze molecule",type="primary",use_container_width=True)
+    st.caption("Name lookup uses PubChem and requires internet access.")
+if "chem_result" not in st.session_state: st.session_state.chem_result=None
+if go:
     try:
-        Chem.Kekulize(kekule, clearAromaticFlags=True)
-        for bond in kekule.GetBonds():
-            bt = bond.GetBondType()
-            if bt == BondType.SINGLE:
-                single += 1
-                sigma += 1
-            elif bt == BondType.DOUBLE:
-                double += 1
-                sigma += 1
-                pi += 1
-            elif bt == BondType.TRIPLE:
-                triple += 1
-                sigma += 1
-                pi += 2
-            else:
-                other += 1
-                # Aromatic bonds in a successful Kekulé representation should be resolved.
-                if bt == BondType.AROMATIC:
-                    aromatic += 1
-                    sigma += 1
-                    pi += 0.5
-    except Exception:
-        for bond in mol.GetBonds():
-            bt = bond.GetBondType()
-            if bt == BondType.SINGLE:
-                single += 1; sigma += 1
-            elif bt == BondType.DOUBLE:
-                double += 1; sigma += 1; pi += 1
-            elif bt == BondType.TRIPLE:
-                triple += 1; sigma += 1; pi += 2
-            elif bt == BondType.AROMATIC:
-                aromatic += 1; sigma += 1
-    return {"Single": single, "Double": double, "Triple": triple, "Aromatic (unresolved)": aromatic,
-            "Other": other, "Sigma bonds (estimated)": sigma, "Pi bonds (estimated)": pi}
-
-def make_3d_block(mol, explicit_h=True):
-    m3d = Chem.AddHs(mol) if explicit_h else Chem.Mol(mol)
-    params = AllChem.ETKDGv3()
-    params.randomSeed = 2026
-    status = AllChem.EmbedMolecule(m3d, params)
-    if status != 0:
-        raise ValueError("RDKit could not generate a 3D conformer for this molecule.")
-    try:
-        if AllChem.MMFFHasAllMoleculeParams(m3d):
-            AllChem.MMFFOptimizeMolecule(m3d, maxIters=250)
-        elif AllChem.UFFHasAllMoleculeParams(m3d):
-            AllChem.UFFOptimizeMolecule(m3d, maxIters=250)
-    except Exception:
-        pass
-    return Chem.MolToMolBlock(m3d), m3d
-
-if make_3d:
-    try:
-        with st.spinner("Resolving molecule and calculating properties..."):
-            mol, resolved_smiles = build_molecule(query, input_mode)
-            mol_2d = Chem.Mol(mol)
-            AllChem.Compute2DCoords(mol_2d)
-            molblock_3d, mol_3d = make_3d_block(mol, include_h)
-            st.session_state.last_result = {
-                "mol": mol, "mol_2d": mol_2d, "resolved_smiles": resolved_smiles,
-                "molblock_3d": molblock_3d, "mol_3d": mol_3d, "query": query, "mode": input_mode
-            }
-    except requests.RequestException:
-        st.error("Could not reach PubChem. Check your internet connection, or choose SMILES input.")
-    except Exception as exc:
-        st.error(str(exc))
-
-result = st.session_state.last_result
-
-if result:
-    mol = result["mol"]
-    st.subheader(f"Results for: {result['query']}")
-    st.caption(f"Input type: {result['mode']} · Structure parsed successfully")
-
-    formula = rdMolDescriptors.CalcMolFormula(mol)
-    mw = Descriptors.MolWt(mol)
-    exact_mw = Descriptors.ExactMolWt(mol)
-    atoms = mol.GetNumAtoms()
-    heavy_atoms = mol.GetNumHeavyAtoms()
-    rings = rdMolDescriptors.CalcNumRings(mol)
-    rotatable = Lipinski.NumRotatableBonds(mol)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Molecular formula", formula)
-    c2.metric("Molecular weight", f"{mw:.3f} g/mol")
-    c3.metric("Heavy atoms", heavy_atoms)
-    c4.metric("Rings", rings)
-    c5.metric("Rotatable bonds", rotatable)
-
-    tab2d, tab3d, tab_bonds, tab_stereo, tab_export = st.tabs(
-        ["🧬 2D Structure", "🧊 3D Structure", "🔗 Bond Analysis", "🧭 Configuration", "⬇️ Export"]
-    )
-
-    with tab2d:
-        left, right = st.columns([1.1, 1])
-        with left:
-            st.image(Draw.MolToImage(result["mol_2d"], size=(650, 450)), caption="2D molecular depiction", use_container_width=True)
-        with right:
-            st.markdown("**SMILES**")
-            st.code(Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True), language="text")
-            st.markdown("**Connectivity-only SMILES**")
-            st.code(Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False), language="text")
-            st.markdown("**Atom summary**")
-            atom_rows = []
-            for atom in mol.GetAtoms():
-                atom_rows.append({
-                    "Atom index": atom.GetIdx(),
-                    "Element": atom.GetSymbol(),
-                    "Formal charge": atom.GetFormalCharge(),
-                    "Degree": atom.GetDegree(),
-                    "Aromatic": atom.GetIsAromatic()
-                })
-            st.dataframe(atom_rows, use_container_width=True, hide_index=True)
-
-    with tab3d:
-        st.markdown("Rotate with the mouse; scroll to zoom. The displayed conformer is computationally generated.")
-        escaped_block = result["molblock_3d"].replace("\\", "\\\\").replace("`", "\\`")
-        html = f"""
-        <div id="viewer" style="width:100%;height:520px;position:relative;border:1px solid #ddd;border-radius:10px;"></div>
-        <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-        <script>
-        const element = document.getElementById('viewer');
-        const viewer = $3Dmol.createViewer(element, {{backgroundColor: 'white'}});
-        const molData = `{escaped_block}`;
-        viewer.addModel(molData, 'sdf');
-        viewer.setStyle({{}}, {{stick: {{radius: 0.16}}, sphere: {{scale: 0.23}}}});
-        viewer.zoomTo();
-        viewer.render();
-        window.addEventListener('resize', () => viewer.resize());
-        </script>
-        """
-        components.html(html, height=540, scrolling=False)
-        st.download_button(
-            "Download generated 3D structure (.mol)",
-            data=result["molblock_3d"],
-            file_name="molecule_3d.mol",
-            mime="chemical/x-mdl-mol"
-        )
-
-    with tab_bonds:
-        counts = count_bonds(mol)
+        with st.spinner("Calculating molecular information..."):
+            mol,smi=parse(query,mode); m2=Chem.Mol(mol); AllChem.Compute2DCoords(m2)
+            m3=build3d(mol,add_h); block=Chem.MolToMolBlock(m3)
+            st.session_state.chem_result={"mol":mol,"m2":m2,"m3":m3,"block":block,"query":query,"mode":mode,"smi":smi}
+    except requests.RequestException: st.error("Could not connect to PubChem. Try SMILES input.")
+    except Exception as e: st.error(str(e))
+r=st.session_state.chem_result
+if r:
+    m=r["mol"]; m3=r["m3"]; formula=rdMolDescriptors.CalcMolFormula(m); canon=Chem.MolToSmiles(m,canonical=True,isomericSmiles=True)
+    counts,sigma,pi,bondrows=bond_analysis(m); centers,stereobonds=stereochemistry(Chem.Mol(m)); lengths,angles=geometry(m3)
+    st.subheader("📋 Basic Information")
+    rows=[("Input SMILES",r["smi"]),("Canonical SMILES",canon),("Molecular Formula",formula),("Atoms",m.GetNumAtoms()),("Heavy Atoms",m.GetNumHeavyAtoms()),("Heavy-Atom Bonds",m.GetNumBonds()),("Sigma (σ) Bonds",sigma),("Pi (π) Bonds",pi),("Total Bonds (σ + π)",sigma+pi)]
+    left,right=st.columns(2)
+    with left:
+        for k,v in rows[:5]: st.markdown(f"**{k}:** {v}")
+    with right:
+        for k,v in rows[5:]: st.markdown(f"**{k}:** {v}")
+    st.caption("Sigma/pi counts include implicit hydrogens. For ethanol (CCO): formula C₂H₆O, 3 atoms, 3 heavy atoms, 2 heavy-atom bonds, 8 sigma bonds, 0 pi bonds, total 8.")
+    a,b,c,d=st.columns(4)
+    a.metric("Molecular weight",f"{Descriptors.MolWt(m):.3f} g/mol"); b.metric("Exact mass",f"{Descriptors.ExactMolWt(m):.4f} Da")
+    c.metric("Rings",rdMolDescriptors.CalcNumRings(m)); d.metric("Rotatable bonds",Lipinski.NumRotatableBonds(m))
+    t2,t3,tb,ts,te=st.tabs(["🧬 2D Structure","🧊 3D Viewer","🔗 Bond Analysis","🧭 Stereochemistry","⬇️ Export"])
+    with t2:
+        c1,c2=st.columns([1,1])
+        with c1: st.image(Draw.MolToImage(r["m2"],size=(700,500)),caption="2D molecular structure",use_container_width=True)
+        with c2:
+            st.markdown("**Canonical isomeric SMILES**"); st.code(canon)
+            st.markdown("**Molecular properties**")
+            st.write({"Formula":formula,"Molecular weight (g/mol)":round(Descriptors.MolWt(m),4),"TPSA (Å²)":round(rdMolDescriptors.CalcTPSA(m),3),"LogP estimate":round(Descriptors.MolLogP(m),3),"H-bond donors":rdMolDescriptors.CalcNumHBD(m),"H-bond acceptors":rdMolDescriptors.CalcNumHBA(m)})
+        st.subheader("Atom table")
+        st.dataframe([{"Index":a.GetIdx(),"Element":a.GetSymbol(),"Formal charge":a.GetFormalCharge(),"Degree":a.GetDegree(),"Aromatic":a.GetIsAromatic(),"In ring":a.IsInRing()} for a in m.GetAtoms()],use_container_width=True,hide_index=True)
+    with t3:
+        st.write("Drag to rotate, scroll to zoom, and click an atom to inspect its index, element and 3D coordinates.")
+        components.html(viewer_html(r["block"],style,labels),height=550,scrolling=False)
+        st.download_button("Download generated 3D structure (.mol)",r["block"],"molecule_3d.mol",mime="chemical/x-mdl-molfile")
+    with tb:
         st.subheader("Bond counts")
-        st.dataframe([{"Bond/property": k, "Count": v} for k, v in counts.items()], hide_index=True, use_container_width=True)
-        st.warning("Sigma/pi counts are estimates from a Kekulé representation. Aromatic bonding is delocalized, so individual aromatic bonds do not have fixed localized single/double character.")
-        bond_rows = []
-        for bond in mol.GetBonds():
-            bond_rows.append({
-                "Bond index": bond.GetIdx(),
-                "Atom 1": f"{bond.GetBeginAtomIdx()} ({bond.GetBeginAtom().GetSymbol()})",
-                "Atom 2": f"{bond.GetEndAtomIdx()} ({bond.GetEndAtom().GetSymbol()})",
-                "Bond type": str(bond.GetBondType()),
-                "Aromatic": bond.GetIsAromatic(),
-                "In ring": bond.IsInRing()
-            })
-        st.subheader("Individual bonds")
-        st.dataframe(bond_rows, hide_index=True, use_container_width=True)
-
-    with tab_stereo:
-        st.subheader("Stereochemical information")
-        stereo_atoms = []
-        for atom in mol.GetAtoms():
-            if atom.HasProp("_CIPCode"):
-                stereo_atoms.append({
-                    "Atom index": atom.GetIdx(),
-                    "Element": atom.GetSymbol(),
-                    "CIP label": atom.GetProp("_CIPCode"),
-                    "Chiral tag": str(atom.GetChiralTag())
-                })
-        stereo_bonds = []
-        for bond in mol.GetBonds():
-            stereo = str(bond.GetStereo())
-            if stereo not in ("STEREONONE", "STEREOANY"):
-                stereo_bonds.append({
-                    "Bond index": bond.GetIdx(),
-                    "Atoms": f"{bond.GetBeginAtomIdx()}–{bond.GetEndAtomIdx()}",
-                    "Stereo": stereo
-                })
-        if stereo_atoms:
-            st.markdown("**Tetrahedral stereocentres (CIP labels)**")
-            st.dataframe(stereo_atoms, hide_index=True, use_container_width=True)
-        else:
-            st.write("No assigned R/S tetrahedral stereocentres were found in this input.")
-        if stereo_bonds:
-            st.markdown("**Stereochemical double bonds**")
-            st.dataframe(stereo_bonds, hide_index=True, use_container_width=True)
-        else:
-            st.write("No assigned E/Z double-bond stereochemistry was found in this input.")
-        st.caption("A blank result does not prove that a molecule has no possible stereoisomers; the input must specify stereochemistry for it to be reported.")
-
-    with tab_export:
-        st.subheader("Download your results")
-        st.download_button(
-            "Download 2D structure image (.png)",
-            data=_png_bytes(result["mol_2d"]),
-            file_name="molecule_2d.png",
-            mime="image/png"
-        )
-        st.download_button(
-            "Download structure (.sdf)",
-            data=Chem.MolToMolBlock(result["mol"]),
-            file_name="molecule.sdf",
-            mime="chemical/x-mdl-sdfile"
-        )
-        report = (
-            f"Query: {result['query']}\nInput mode: {result['mode']}\n"
-            f"Formula: {formula}\nMolecular weight: {mw:.5f} g/mol\nExact molecular weight: {exact_mw:.5f} g/mol\n"
-            f"Atoms (excluding implicit H): {atoms}\nHeavy atoms: {heavy_atoms}\nRings: {rings}\n"
-            f"Rotatable bonds: {rotatable}\nCanonical isomeric SMILES: {Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)}\n"
-            f"Bond analysis: {counts}\n"
-        )
-        st.download_button("Download property report (.txt)", data=report, file_name="molecule_report.txt", mime="text/plain")
-
+        st.dataframe([{"Bond metric":k,"Count":v} for k,v in [*counts.items(),("Sigma bonds including H",sigma),("Pi bonds (Kekulé representation)",pi),("Total σ + π contributions",sigma+pi)]],use_container_width=True,hide_index=True)
+        st.warning("Aromatic bonding is delocalized. Pi counts use localized double bonds in a Kekulé representation and are intended for introductory learning.")
+        st.subheader("Individual bonds in explicit-H molecule")
+        st.dataframe(bondrows,use_container_width=True,hide_index=True)
+        st.subheader("Generated 3D bond lengths (Å)")
+        st.dataframe(lengths,use_container_width=True,hide_index=True)
+        st.subheader("Generated 3D bond angles (°)")
+        st.dataframe(angles,use_container_width=True,hide_index=True)
+    with ts:
+        st.subheader("R/S configuration and chirality")
+        st.dataframe(centers,use_container_width=True,hide_index=True) if centers else st.write("No tetrahedral stereocentres were identified in the input.")
+        st.subheader("E/Z and other stereochemical bonds")
+        st.dataframe(stereobonds,use_container_width=True,hide_index=True) if stereobonds else st.write("No explicitly assigned stereochemical bonds were found in the input.")
+        st.info("R/S and E/Z labels depend on stereochemistry specified or assigned in the input SMILES. The generated conformer alone does not establish experimental configuration.")
+        st.write(f"Generated 3D conformer: {'Yes' if m3.GetNumConformers() else 'No'} · Atoms in 3D model: {m3.GetNumAtoms()}")
+    with te:
+        st.download_button("Download 2D structure (.png)",png_bytes(r["m2"]),"molecule_2d.png",mime="image/png")
+        st.download_button("Download structure (.sdf)",Chem.MolToMolBlock(m),"molecule.sdf",mime="chemical/x-mdl-sdfile")
+        report="\n".join([f"{k}: {v}" for k,v in rows]+[f"Molecular weight: {Descriptors.MolWt(m):.5f} g/mol",f"Exact mass: {Descriptors.ExactMolWt(m):.5f} Da",f"Rings: {rdMolDescriptors.CalcNumRings(m)}",f"Rotatable bonds: {Lipinski.NumRotatableBonds(m)}",f"R/S centres: {centers}",f"E/Z bonds: {stereobonds}","Note: 3D geometry is estimated; aromatic bonding is delocalized."])
+        st.download_button("Download property report (.txt)",report,"molecule_report.txt",mime="text/plain")
 else:
-    st.markdown("### Try a sample")
-    st.write("Choose **Molecule name** and enter `caffeine`, or choose **SMILES** and enter `CCO` for ethanol.")
-    st.markdown("### How it works")
-    st.write("RDKit parses the structure and calculates properties. For molecule-name searches, PubChem supplies a matching SMILES string. RDKit then generates a 2D depiction and an estimated 3D conformer.")
+    st.subheader("Start exploring a molecule")
+    st.write("Try SMILES `CCO` for ethanol. Basic Information should report C₂H₆O, 3 atoms, 3 heavy atoms, 2 heavy-atom bonds, 8 sigma bonds and 0 pi bonds.")
